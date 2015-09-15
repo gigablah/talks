@@ -1,0 +1,589 @@
+From Source Code to Containers
+15 Sep 2015
+
+Chris Heng
+Pie.co
+kuanyen@pie.co
+@gigablah
+
+
+* About me
+
+Chris Heng
+
+DevOps at Pie.co (@piethis)
+
+We make an awesome chat app for work
+Check it out on web, the App Store and Google Play!
+
+.image assets/pie.png _ 600
+
+
+* Creating containers
+
+* The basics
+
+Given an executable, how would you turn it into a container?
+
+Easy, just pick a base, install the process and run it in the foreground, e.g. nginx:
+
+  # Pull base image.
+  FROM ubuntu
+
+  # Install Nginx.
+  RUN add-apt-repository -y ppa:nginx/stable && apt-get update \
+   && apt-get install -y nginx && rm -rf /var/lib/apt/lists/*
+
+  # Define mountable directories.
+  VOLUME ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d", "/var/log/nginx", "/var/www/html"]
+
+  # Define working directory.
+  WORKDIR /etc/nginx
+
+  # Define default command.
+  CMD ["nginx", "-g", "daemon off;"]
+
+  # Expose ports.
+  EXPOSE 80 443
+
+
+* 
+It's even easier if you have a statically linked executable
+
+Here's your "minimal Docker image":
+
+  FROM scratch
+  ADD bin/foobar /foobar
+  CMD ["/foobar"]
+
+Of course, chances are your applications are much more complex
+
+Let's pick another example -- a web app
+
+
+* Our target
+
+Flarum, bleeding edge PHP forum software
+
+.image assets/flarum.png _ 900
+
+
+* Considerations
+
+The application is in active development
+
+Feature branches, frequent commits
+
+Devs and testers would want to work on a local checkout
+
+Regular users need stable or versioned releases
+
+Certain users might wish to follow the latest updates e.g. nightly builds
+
+
+* All-in-one approach
+
+Pack everything into one "distribution" container
+
+This works well for users who just want to try out the software
+
+`docker` `pull` the image, run it without any parameters, and it "just works"
+
+- Provide customization with environment variables
+- Provide data retention with volumes or mounts
+
+
+* 
+But what if the application involves more than one process?
+
+Flarum requires:
+
+- php-fpm
+- mysql / mariadb
+- nginx / apache
+
+
+* Containers with multiple processes
+
+Running multiple processes in a container is fine according to Docker devs -- despite the "single process per container" philosophy
+
+You'll need an init system or process supervisor
+
+- supervisord: Not intended to be run as PID 1, zombie reaping problem
+- runit: Needs a wrapper script to handle environment variables, e.g. [[https://github.com/phusion/baseimage-docker][phusion/baseimage]]
+
+[[https://github.com/just-containers/s6-overlay][s6-overlay]] is an init system that handles all these issues
+
+To "play nice" with the Docker design, you should designate one particular process as the "primary" one that will cause the whole container to shut down when it terminates
+
+
+* Our base container
+
+We'll use [[http://www.alpinelinux.org/][Alpine Linux]] for its small size
+
+  FROM alpine:3.2
+
+  RUN apk add --update bash && rm -rf /var/cache/apk/*
+  ADD s6-overlay-amd64.tar.gz /
+  COPY rootfs /
+
+  ENTRYPOINT ["/init"]
+
+s6-overlay is obtained from
+[[https://github.com/just-containers/s6-overlay/releases/download/v1.14.0.4/s6-overlay-amd64.tar.gz]]
+
+The `rootfs` directory simply has placeholder directories for init files
+
+
+* Distribution container
+
+We install everything that's required to run the Flarum release:
+
+  FROM gigablah/alpine-base:3.2
+
+  # Install nginx, php-fpm and mariadb.
+  RUN apk add --update nginx ca-certificates \
+   && apk add php php-fpm php-json php-ctype php-curl php-openssl php-dom \
+   && apk add php-pdo php-pdo_mysql php-gd php-iconv php-intl php-mcrypt \
+   && apk add mariadb mariadb-client \
+   && rm -rf /var/cache/apk/*
+
+  # Copy configuration and service init files.
+  COPY rootfs /
+
+  # Bind mount for our web app
+  VOLUME ["/opt/www/flarum"]
+
+  # Expose web ports.
+  EXPOSE 80 443
+
+* Entrypoint scripts
+
+If a process has additional init requirements, one-time setup, etc, common practice is to prepare an entrypoint script which wraps the target process
+
+  ENTRYPOINT ["/entrypoint.sh"] # this script calls exec "$@"
+
+Since we have an init system, each service will have its own "run" script that is used for this purpose
+
+For `s6-overlay`, the structure looks like this
+
+  etc
+  └── services.d
+      ├── mysql
+      │   └── run
+      ├── nginx
+      │   └── run
+      └── php-fpm
+          └── run
+
+
+* MySQL / MariaDB init
+
+Init for nginx and php-fpm is straightforward, but the database needs first-time setup
+
+  #!/bin/bash
+  dir=`my_print_defaults mysqld | grep -- --datadir | sed -e "s|^.*=\(.*\)|\1|"`
+  dir=${dir:-/var/lib/mysql}
+  if [ ! -d "$dir/mysql" ]; then
+    echo "Default database not found in $dir, running setup..."
+    mysql_install_db --user=mysql --rpm
+  fi
+  if [ ! -d "$dir/flarum" ]; then
+    echo "Flarum database not found in $dir, running setup..."
+    /usr/bin/mysqld_safe &
+    mysql_pid=$!
+    until mysqladmin ping &>/dev/null; do sleep 0.2; done
+    mysql -e "CREATE DATABASE flarum CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    mysql -e "CREATE USER 'flarum'@'%' IDENTIFIED BY 'password'"
+    mysql -e "GRANT ALL PRIVILEGES ON flarum.* TO 'flarum'@'%'"
+    mysqladmin shutdown
+    wait $mysql_pid
+  fi
+
+  exec /usr/bin/mysqld_safe
+
+
+* Development container
+
+Devs or contributors would wish to work on a checkout of the source code outside the container
+
+In this case it would be convenient to containerize just the development environment
+
+- Run build tools or scripts inside the container
+- Reduces ramp-up time
+- Doesn't pollute the host machine
+
+Bind mount the application code at runtime
+
+
+* 
+Back to our PHP application
+
+- php-fpm
+- mysql / mariadb
+- nginx / apache
+
+Now with dev dependencies:
+
+- composer
+- git, subversion, hg
+- nodejs, npm
+- gulp, bower
+- binutils, libc-dev, gcc, g++, make
+
+
+* Containers as builders / compilers
+
+Flarum has a complex build process
+
+- Uses Composer to pull and update vendor PHP libraries
+- Uses Bower to pull and update vendor Javascript libraries
+- Uses a Gulp pipeline to compile and minify LESS and ES6 Javascript modules
+
+In addition, Flarum has support for extensions
+
+Each extension is a repository with the same build process as before
+
+After producing our .css and .js output files, our dev dependencies are no longer needed to actually run the web app
+
+We can isolate this build process into another container
+
+
+* Workflow
+
+Spin up builder container and bind mount the source directory
+
+Execute scripts and produce a build
+
+Remove builder container
+
+Spin up runtime container and bind mount the produced build
+
+
+* Build organization
+
+We now have multiple build steps, so let's use a Makefile
+
+  IMAGE = gigablah/flarum
+  TAG = master
+  BUILD = gigablah/flarum-dev
+
+  .PHONY: all ../flarum build run
+
+  all: build run
+
+  ../flarum:
+    docker run --rm -v $(PWD):/tmp -v $(PWD)/../flarum:/build -e TAG=$(TAG) $(BUILD) /tmp/build.sh
+
+  build:
+    docker build -t $(IMAGE):$(TAG) --rm .
+
+  run: ../flarum
+    docker run -d --name flarum -v $(PWD)/../flarum:/opt/www/flarum -p 80:80 $(IMAGE):$(TAG)
+
+
+* 
+This is what the (partial) build script looks like:
+
+  #!/usr/bin/env bash
+  BASE=${DIR:-/build}
+
+  # Clone flarum repository
+  if [ ! -d "$BASE/flarum" ]; then git clone "https://github.com/flarum/flarum.git" "$BASE"; fi
+
+  # Install all Composer dependencies
+  if [ ! -d "$BASE/flarum/vendor" ]; then
+    cd $BASE/flarum
+    composer install --prefer-dist --optimize-autoloader --ignore-platform-reqs --no-dev
+    composer require flarum/core:dev-master@dev --prefer-dist --update-no-dev
+  fi
+
+  # Install frontend dependencies
+  cd $BASE/flarum/vendor/flarum/core/js && bower install --allow-root
+
+  for app in forum admin; do
+    cd "$BASE/flarum/vendor/flarum/core/js/${app}"
+    npm link gulp flarum-gulp babel-core
+    gulp --production
+    rm -rf "$BASE/flarum/vendor/flarum/core/js/${app}/node_modules"
+  done
+
+
+* Putting your containers on production
+
+Process distribution will largely depend on your architecture and requirements
+
+For example:
+
+- remove mariadb and use a centralized database service
+- remove nginx and use a dedicated nginx container with load balancing
+
+Still a use case for multiple processes, e.g. running php-fpm, cron and syslog together
+
+Inter-container communication via:
+
+- container links
+- DNS based service discovery
+- overlay networking
+
+
+* Maintaining containers
+
+* Maintaining your containers
+
+Other than application updates, there could be...
+
+- OS updates
+- System package updates
+- Security patches
+
+Rebuild the base images and re-deploy all your containers
+
+
+* Some issues...
+
+By now we have Dockerfiles, shell scripts and Makefiles
+
+- Dockerfiles are also essentially shell scripts
+- Primitive; maintenance nightmare
+
+Can I quickly upgrade a package without rebuilding the whole image?
+
+- E.g. patch OpenSSL in multiple images
+
+
+* Some issues...
+
+How do I determine which images need updates?
+
+What package versions are currently installed?
+
+Cannot be determined directly from most Dockerfiles
+
+Lots of custom scripting needed for
+
+- filesystem inspection
+- dependency version pinning
+- metadata / image labels
+
+
+* Incremental updates
+
+Treat your containers like actual hosts
+
+Enter, inspect, update each container and commit changes back to image
+
+But that's still custom scripting
+
+What about... using tried and tested tools?
+
+- Ansible / Chef / Puppet / Salt
+
+We'll focus on Ansible
+
+
+* Using Ansible as an image build tool
+
+But Ansible works through SSH, right?
+
+- Most containers don't include an SSH daemon
+
+There's a `chroot` connection option
+
+- But no implementation examples found
+- Plus it's probably a bad idea to mess around in `/var/lib/docker`
+
+Still, this problem will be solved with...
+
+
+* Ansible 2.0 Docker connection (alpha)
+
+Support for connection type of `docker` will be available in (upcoming) Ansible 2.0
+
+For now, install and run Ansible from source
+
+Instead of using SSH to connect to a running container, Ansible scripts will be executed using `docker` `exec`
+
+Inventory host names map to docker container names
+
+
+* Static container inventory
+
+  [targets]
+
+  localhost              ansible_connection=local
+  test_container         ansible_connection=docker
+  another_container      ansible_connection=docker
+
+
+* Ad-hoc container inventory
+
+  - name: Spin up a container
+    hosts: localhost
+    connection: local
+    gather_facts: False
+    sudo: False
+    vars:
+      base_image: gigablah/alpine-python
+      container_name: ansible_test
+    tasks:
+      - name: Start the base container
+        local_action: command docker run -d -t --name {{ container_name }} {{ base_image }} bash
+      - name: Add the container to the inventory
+        add_host: name={{ container_name }}
+
+You can now target `ansible_test` as a Docker host
+
+
+* Updating your images
+
+  - name: Update the image
+    hosts: ansible_test
+    connection: docker
+    vars:
+      container_name: ansible_update
+      image: gigablah/ansible_test
+    pre_tasks:
+      - name: Start the base container
+        local_action: command docker run -d -t --name {{ container_name }} {{ image }} bash
+    roles:
+      - update_openssl
+    post_tasks:
+      - name: Commit the container to an image
+        local_action: command docker commit {{ inventory_hostname }} {{ image }}
+      - name: Stop the running container
+        local_action: command docker kill {{ inventory_hostname }}
+      - name: Remove the container
+        local_action: command docker rm {{ inventory_hostname }}
+
+Note: docker-py module is not used here since integration is broken (as usual)
+
+
+* Caveats
+
+All operations are saved as a single image layer
+
+- Then again, with smaller base images, this isn't such a big deal
+
+Python (and dependencies) needs to be installed in all your images
+
+- Adds ~30mb to the image size
+
+Configuration drift!
+
+- Eventually you'll need to reconcile your Dockerfiles
+
+
+* Building images
+
+If you can update images with Ansible, why not create them with Ansible too?
+
+  - name: Build the image # Note: you need a base image with Python installed
+    hosts: ansible_test
+    connection: docker
+    vars:
+      base_image: gigablah/alpine-python
+    pre_tasks:
+      - name: Start the base container
+        local_action: command docker run -d -t --name {{ container_name }} {{ image }} bash
+    tasks:
+      - name: Install packages # Note: the apk module is new in Ansible 2.0
+        apk: name=curl,git,perl,php-cli,php-json,php-phar,php-openssl update_cache=yes
+      - name: Install Composer
+        shell: curl -sS https://getcomposer.org/installer | php -- --install-dir=bin
+    post_tasks:
+      - name: Commit the container to an image
+        local_action: command docker commit {{ inventory_hostname }} {{ base_image }}
+      - name: Stop the running container
+        local_action: command docker kill {{ inventory_hostname }}
+      - name: Remove the container
+        local_action: command docker rm {{ inventory_hostname }}
+
+
+* Alternative solutions
+
+*Dockerflow* (npm package)
+
+With an Ansible playbook that targets `localhost`:
+
+- Dumps the playbook into shell scripts
+- Mounts them onto a container and executes
+- Saves the filesystem changes into new image (same as previously)
+
+Better than writing the shell scripts by hand
+
+
+* Alternative solutions
+
+*Packer* (from the people who brought you Vagrant)
+
+Machine image builder, can output Docker images too
+
+Has support for provisioners (Ansible / Chef / Puppet / Salt)
+
+Additional image metadata not yet supported (`EXPOSE`, `VOLUME`, etc)
+
+- Thus they have to be specified with runtime flags
+
+
+* Packer example
+
+  {
+    "builders":[{
+      "type": "docker",
+      "image": "ubuntu",
+      "export_path": "image.tar"
+    }],
+    "provisioners":[
+      {
+        "type": "shell",
+        "inline": ["apt-get install -y python-pip python-dev && pip install ansible"]
+      },
+      {
+        "type": "ansible-local",
+        "playbook_file": "playbooks/build.yml"
+      }
+    ],
+    "post-processors": [{
+      "type": "docker-import",
+      "repository": "gigablah/ansible-test",
+      "tag": "0.1"
+    }]
+  }
+
+
+* Summary
+
+Different considerations depending on environments and architecture
+
+Base images
+
+- Single process, or with init system for multiple processes
+
+Development
+
+- Development image, bind mounted source code
+- Optionally convert development images into different builder "binaries"
+- Runtime image, bind mounted source build and/or data persistence volumes
+
+Production
+
+- Distribution image with runtime environment and release build
+- Single process images with container links / service discovery / overlay network
+
+
+* 
+How our build workflow has evolved:
+
+- Simple Dockerfiles
+- Dockerfiles with mounted build scripts, entrypoint scripts and Makefiles for organization
+- Scripts replaced with configuration management for better structure, reusability and maintainability
+
+
+* Some thoughts
+
+You don't necessarily need Dockerfiles to build or maintain Docker images!
+
+Existing tools are still very much relevant; Docker images are artifacts
+
+Expect a shift away from complex Dockerfiles? (maintainability / security concerns)
