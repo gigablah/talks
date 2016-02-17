@@ -1,0 +1,209 @@
+dashing-go
+18 Feb 2016
+
+Chris Heng
+bigblah@gmail.com
+@gigablah
+
+
+* Dashing
+
+[[http://dashing.io/][Dashboard framework created by Shopify]] - Sinatra (Ruby) based
+
+.image assets/screenshot.png _ 800
+
+* Rewriting in Go
+
+Why? I just wanted to learn Go :)
+
+(This was back in March 2014)
+
+API is simple enough for a weekend project
+
+* Backend
+
+Implement six routes:
+
+- GET / - Redirect to first available dashboard
+- GET /events - Primary endpoint, broadcasts event stream using Server-Sent Events
+- GET /{dashboard} - Render a dashboard template (ERB file)
+- POST /dashboards/{dashboard} - Post JSON data to a dashboard
+- GET /views/widgets/{type} - Render a widget tyoe
+- POST /widgets/{widget} - Post JSON data to a widget
+
+Render ERB templates? There's a package for that: [[https://github.com/karlseguin/gerb][karlseguin/gerb]]
+
+Dashing also has a CLI for generating new dashboard skeletons - we'll get to that later
+
+* Events, widgets and jobs
+
+Each dashboard event contains:
+
+- ID: corresponds to the ID given to the widget on the dashboard template
+- Data: arbitrary data
+- Target: apparently unused
+
+Widgets are blocks containing graphs, lists, gauges and so on. Each type comprises:
+
+- {type}.html - HTML template
+- {type}.scss - SCSS styles
+- {type}.coffee - Widget module script. Yes, in CoffeeScript
+
+Jobs are routines that periodically broadcast events for a particular widget
+
+You can have a dashboard without jobs; just post events to the widget endpoint
+
+* What I ended up with
+
+Channels!
+
+Event subscription and fan-out using a broker
+
+Routes and handlers are implemented using the [[https://github.com/go-martini/martini][Martini]] framework
+
+Jobs are goroutines that follow the register-upon-init pattern
+
+Frontend is kept as-is since we want compatibility with existing Dashing widgets
+
+However there's a slight problem...
+
+* Frontend
+
+The frontend uses Shopify's Batman.js framework
+
+Dashing uses [[https://github.com/rails/sprockets][Sprockets]] to compile front-end assets (css, js)
+
+Still Ruby-based!
+
+(the whole point is to avoid Ruby...)
+
+Oh look! A node.js version of Sprockets, called [[https://github.com/pthrasher/snockets][Snockets]] - just what we need!
+
+* Rewriting the asset pipeline
+
+Converted the pipeline to use Grunt and Snockets
+
+Replaced the `dashing new` generator with [[http://yeoman.io/][Yeoman]]
+
+Available as a separate project: [[https://github.com/gigablah/generator-dashing-go][generator-dashing-go]]
+
+* Generating a new dashboard app
+
+  npm install -g grunt-cli bower yo generator-dashing-go
+  yo dashing-go
+
+Starting the server
+
+  go get
+  go run server.go
+
+Generating new dashboards / jobs / widgets
+
+  yo dashing-go:dashboard foo
+  yo dashing-go:job foo
+  yo dashing-go:widget foo
+
+* Problem
+
+I didn't include token authentication!
+
+Martini is no longer in vogue (author replaced it with Negroni)
+
+I wanted to user idiomatic, unfancy Go
+
+Time to refactor!
+
+* dashing-go.v1
+
+Frameworkless!
+
+All you need is http.HandlerFunc
+
+Oh, and maybe a router...
+
+* Routing
+
+Settled with [[https://github.com/husobee/vestigo][husobee/vestigo]]
+
+- Radix Tree based
+- Attach URL params to Request.RawQuery instead of some context struct
+
+  router := vestigo.NewRouter()
+  router.Get("/hello/:name", HelloHandler)
+  http.ListenAndServe(":1234", router)
+
+  ...
+
+  func HelloHandler(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(200)
+    w.Write([]byte("welcome "+r.FormValue(":name")))
+  }
+
+Behold! A pristine http.HandlerFunc!
+
+* Imports
+
+I wanted to mitigate Go's current issues with packaging (as of 1.5)
+
+Switched 3rd party imports to use [[http://labix.org/gopkg.in][gopkg.in]]
+
+Allows version pinning using branches or tags
+
+dashing-go master branch is left untouched to prevent existing installs from breaking
+
+Development will continue in v1, v2, etc branches
+
+  "gopkg.in/gigablah/dashing-go.v1"
+  _ "gopkg.in/gigablah/dashing-go.v1/example/jobs"
+
+* Invoking dashing-go
+
+Dashing.Start() no longer starts a webserver
+
+It now implements http.Handler interface (ServeHTTP method)
+
+This lets users integrate dashing-go into their own apps easily
+
+More importantly, they can wrap it with their own middleware... like authentication!
+
+  dash := dashing.NewDashing().Start()
+
+  log.Fatal(http.ListenAndServe(":"+port, tokenAuthMiddleware(dash)))
+
+* Middleware
+
+Example middleware that implements token auth like the original Dashing
+
+  func tokenAuthMiddleware(h http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+      if r.Method == "POST" {
+        body, _ := ioutil.ReadAll(r.Body)
+        r.Body.Close()
+        r.Body = ioutil.NopCloser(bytes.NewReader(body))
+        var data map[string]interface{}
+        json.Unmarshal(body, &data)
+        token, ok := data["auth_token"]
+        if !ok {
+          http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+          return
+        }
+        if result := subtle.ConstantTimeCompare(Auth, []byte(token.(string))); result != 1 {
+          http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+          return
+        }
+      }
+      h.ServeHTTP(w, r)
+    })
+  }
+
+* Future improvements?
+
+Websockets?
+
+Gulp / webpack / ES6?
+
+Drop Batman.js (since Shopify no longer uses or maintains it) ...
+
+and replace it with React? Mithril? virtual-dom?
+
+* Questions? Suggestions?
