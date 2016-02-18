@@ -28,7 +28,7 @@ Implement six routes:
 - GET /events - Primary endpoint, broadcasts event stream using Server-Sent Events
 - GET /{dashboard} - Render a dashboard template (ERB file)
 - POST /dashboards/{dashboard} - Post JSON data to a dashboard
-- GET /views/widgets/{type} - Render a widget tyoe
+- GET /views/{type}.html - Render a widget template
 - POST /widgets/{widget} - Post JSON data to a widget
 
 Render ERB templates? There's a package for that: [[https://github.com/karlseguin/gerb][karlseguin/gerb]]
@@ -63,11 +63,13 @@ Routes and handlers are implemented using the [[https://github.com/go-martini/ma
 
 Jobs are goroutines that follow the register-upon-init pattern
 
+* Frontend
+
 Frontend is kept as-is since we want compatibility with existing Dashing widgets
 
 However there's a slight problem...
 
-* Frontend
+* The asset pipeline
 
 The frontend uses Shopify's Batman.js framework
 
@@ -79,7 +81,7 @@ Still Ruby-based!
 
 Oh look! A node.js version of Sprockets, called [[https://github.com/pthrasher/snockets][Snockets]] - just what we need!
 
-* Rewriting the asset pipeline
+* Rewriting the pipeline
 
 Converted the pipeline to use Grunt and Snockets
 
@@ -107,7 +109,7 @@ Generating new dashboards / jobs / widgets
 
 I didn't include token authentication!
 
-Martini is no longer in vogue (author replaced it with Negroni)
+Martini is no longer in vogue (author replaced it with [[https://github.com/codegangsta/negroni][Negroni]])
 
 I wanted to user idiomatic, unfancy Go
 
